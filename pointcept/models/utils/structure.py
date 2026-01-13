@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import spconv.pytorch as spconv
 
 try:
@@ -207,3 +208,61 @@ class Point(Dict):
         self["octree"] = octree
         self["octree_order"] = order
         self["octree_inverse"] = inverse
+    
+    @torch.no_grad()
+    def get_padding_and_inverse(self, patch_size):
+        pad_key = "pad"
+        unpad_key = "unpad"
+        cu_seqlens_key = "cu_seqlens_key"
+        if (
+            pad_key not in self.keys()
+            or unpad_key not in self.keys()
+            or cu_seqlens_key not in self.keys()
+        ):
+            offset = self.offset
+            bincount = offset2bincount(offset)
+            bincount_pad = (
+                torch.div(
+                    bincount + patch_size - 1,
+                    patch_size,
+                    rounding_mode="trunc",
+                )
+                * patch_size
+            )
+            # only pad point when num of points larger than patch_size
+            mask_pad = bincount > patch_size
+            bincount_pad = ~mask_pad * bincount + mask_pad * bincount_pad
+            _offset = nn.functional.pad(offset, (1, 0))
+            _offset_pad = nn.functional.pad(torch.cumsum(bincount_pad, dim=0), (1, 0))
+            pad = torch.arange(_offset_pad[-1], device=offset.device)
+            unpad = torch.arange(_offset[-1], device=offset.device)
+            cu_seqlens = []
+            for i in range(len(offset)):
+                unpad[_offset[i] : _offset[i + 1]] += _offset_pad[i] - _offset[i]
+                if bincount[i] != bincount_pad[i]:
+                    pad[
+                        _offset_pad[i + 1]
+                        - patch_size
+                        + (bincount[i] % patch_size) : _offset_pad[i + 1]
+                    ] = pad[
+                        _offset_pad[i + 1]
+                        - 2 * patch_size
+                        + (bincount[i] % patch_size) : _offset_pad[i + 1]
+                        - patch_size
+                    ]
+                pad[_offset_pad[i] : _offset_pad[i + 1]] -= _offset_pad[i] - _offset[i]
+                cu_seqlens.append(
+                    torch.arange(
+                        _offset_pad[i],
+                        _offset_pad[i + 1],
+                        step=patch_size,
+                        dtype=torch.int32,
+                        device=offset.device,
+                    )
+                )
+            self[pad_key] = pad
+            self[unpad_key] = unpad
+            self[cu_seqlens_key] = nn.functional.pad(
+                torch.concat(cu_seqlens), (0, 1), value=_offset_pad[-1]
+            )
+        return self[pad_key], self[unpad_key], self[cu_seqlens_key]

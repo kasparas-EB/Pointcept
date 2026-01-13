@@ -18,7 +18,7 @@ setup(
     name = 'pointrope',
     ext_modules = [
         CUDAExtension(
-                name='pointrope',
+                name='pointrope_kernels',
                 sources=[
                     "pointrope.cpp",
                     "kernels.cu",

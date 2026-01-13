@@ -3,6 +3,7 @@ from .default import DefaultSegmentor, DefaultClassifier
 from .modules import PointModule, PointModel
 
 # Backbones
+from .litept import *
 from .sparse_unet import *
 from .point_transformer import *
 from .point_transformer_v2 import *
