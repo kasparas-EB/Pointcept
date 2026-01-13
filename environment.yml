@@ -45,6 +45,7 @@ dependencies:
     - torch-sparse -f https://data.pyg.org/whl/torch-2.5.0+cu124.html
     - torch_geometric
     - spconv-cu124
+    - lion-pytorch
     - peft #for lora finetune
     - git+https://github.com/octree-nn/ocnn-pytorch.git
     - git+https://github.com/openai/CLIP.git
