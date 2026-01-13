@@ -6,7 +6,10 @@ Please cite our work if the code is helpful to you.
 """
 
 import copy
+
+from lion_pytorch import Lion
 import torch
+
 from pointcept.utils.logger import get_root_logger
 from pointcept.utils.registry import Registry
 
@@ -16,6 +19,7 @@ OPTIMIZERS = Registry("optimizers")
 OPTIMIZERS.register_module(module=torch.optim.SGD, name="SGD")
 OPTIMIZERS.register_module(module=torch.optim.Adam, name="Adam")
 OPTIMIZERS.register_module(module=torch.optim.AdamW, name="AdamW")
+OPTIMIZERS.register_module(module=Lion, name="Lion")
 
 
 def build_optimizer(cfg, model, param_dicts=None):
