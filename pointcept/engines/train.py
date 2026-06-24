@@ -34,6 +34,7 @@ from pointcept.utils.scheduler import build_scheduler
 from pointcept.utils.events import EventStorage, ExceptionWriter
 from pointcept.utils.registry import Registry
 from pointcept.datasets.dataloader import DistributedImbalancedSampler
+from pointcept.utils.nonfinite_loss_guard import NonFiniteLossGuard
 
 TRAINERS = Registry("trainers")
 AMP_DTYPE = dict(
@@ -153,6 +154,7 @@ class Trainer(TrainerBase):
         self.logger.info("=> Building hooks ...")
         self.register_hooks(self.cfg.hooks)
         self._gradient_accumulation_counter = 0
+        self.nonfinite_loss_guard = NonFiniteLossGuard(getattr(cfg, "nonfinite_loss_guard_max", 5))
 
     def train(self):
         with EventStorage() as self.storage, ExceptionWriter():
@@ -208,11 +210,12 @@ class Trainer(TrainerBase):
             )  # scale loss
 
         # Backward pass
-        if self.cfg.enable_amp:
-            self.scaler.scale(loss).backward()
-        else:
-            loss.backward()
-        self._gradient_accumulation_counter += 1
+        if self.nonfinite_loss_guard(loss):
+            if self.cfg.enable_amp:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            self._gradient_accumulation_counter += 1
 
         # Perform optimizer step only when enough gradients have accumulated
         if self._gradient_accumulation_counter >= self.cfg.gradient_accumulation_steps:
