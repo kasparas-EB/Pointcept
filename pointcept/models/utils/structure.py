@@ -1,4 +1,5 @@
 import torch
+from torch._C._autograd import SavedTensor
 import spconv.pytorch as spconv
 
 try:
@@ -6,7 +7,6 @@ try:
 except ImportError:
     ocnn = None
 from addict import Dict
-from typing import List
 
 from pointcept.models.utils.serialization import encode
 from pointcept.models.utils import (
@@ -15,6 +15,7 @@ from pointcept.models.utils import (
     offset2bincount,
     bincount2offset,
 )
+from pointcept.utils.activation_checkpoint import register_class_for_ac
 
 
 class Point(Dict):
@@ -207,3 +208,18 @@ class Point(Dict):
         self["octree"] = octree
         self["octree_order"] = order
         self["octree_inverse"] = inverse
+
+
+def _point_ac_handler(fn, obj):
+    new_dict = {}
+    for k, v in obj.items():
+        if isinstance(v, (torch.Tensor, SavedTensor)):
+            new_dict[k] = fn(v)
+        elif isinstance(v, Point):
+            new_dict[k] = _point_ac_handler(fn, v)
+        else:
+            new_dict[k] = v
+    return Point(**new_dict)
+
+
+register_class_for_ac(Point, _point_ac_handler)

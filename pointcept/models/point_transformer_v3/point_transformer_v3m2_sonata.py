@@ -22,6 +22,7 @@ from pointcept.models.builder import MODELS
 from pointcept.models.utils.misc import offset2bincount
 from pointcept.models.utils.structure import Point
 from pointcept.models.modules import PointModule, PointSequential
+import pointcept.utils.activation_checkpoint as ac
 
 
 class LayerScale(nn.Module):
@@ -458,7 +459,6 @@ class GridPooling(PointModule):
         if self.traceable:
             point_dict["pooling_inverse"] = cluster
             point_dict["pooling_parent"] = point
-            point_dict["idx_ptr"] = idx_ptr
         order = point.order
         point = Point(point_dict)
         if self.norm is not None:
@@ -578,8 +578,13 @@ class PointTransformerV3(PointModule):
         mask_token=False,
         enc_mode=False,
         freeze_encoder=False,
+        activation_checkpointing=True,
     ):
         super().__init__()
+
+        if activation_checkpointing:
+            ac.activate()
+
         self.num_stages = len(enc_depths)
         self.order = [order] if isinstance(order, str) else order
         self.shuffle_orders = shuffle_orders
@@ -733,7 +738,11 @@ class PointTransformerV3(PointModule):
         point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
         point.sparsify()
 
-        point = self.enc(point)
+        for stage in self.enc:
+            point = ac.maybe_checkpoint(stage, point)
+
         if not self.enc_mode:
-            point = self.dec(point)
+            for stage in self.dec:
+                point = ac.maybe_checkpoint(stage, point)
+
         return point
