@@ -43,7 +43,7 @@ class NonFiniteLossGuard:
         self.max_nonfinite = max_nonfinite
         self.streak = 0
 
-    def check(
+    def __call__(
         self,
         loss: torch.Tensor,
         *,
