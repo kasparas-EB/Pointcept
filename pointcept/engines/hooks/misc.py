@@ -256,6 +256,16 @@ class CheckpointLoader(HookBase):
                 if comm.get_world_size() == 1:
                     key = key[7:]  # module.xxx.xxx -> xxx.xxx
                 weight[key] = value
+            if not self.strict:
+                model_state_dict = self.trainer.model.state_dict()
+                for key, model_value in model_state_dict.items():
+                    if key in weight and weight[key].shape != model_value.shape:
+                        self.trainer.logger.warning(
+                            f"Shape mismatch for {key}: checkpoint shape "
+                            f"{weight[key].shape}, model shape {model_value.shape}; "
+                            "skipping this key."
+                        )
+                        weight.pop(key)
             load_state_info = self.trainer.model.load_state_dict(
                 weight, strict=self.strict
             )
