@@ -1012,6 +1012,61 @@ class GridSample(object):
 
 
 @TRANSFORMS.register_module()
+class CylinderCrop(object):
+    def __init__(self, point_max=None, sample_rate=None, radius=None, mode="random"):
+        self.point_max = point_max
+        self.sample_rate = sample_rate
+        self.radius = radius
+        assert mode in ["random", "center"]
+        self.mode = mode
+
+    def __call__(self, data_dict):
+        assert "coord" in data_dict.keys()
+        coord = data_dict["coord"]
+        n_points = coord.shape[0]
+
+        # Determine point_max based on sample_rate if provided
+        point_max = (
+            int(self.sample_rate * n_points)
+            if self.sample_rate is not None
+            else self.point_max
+        )
+        if point_max is None:
+            point_max = n_points
+
+        # Skip if nothing to crop
+        if self.radius is None and n_points <= point_max:
+            return data_dict
+
+        # Select center point in XY plane
+        if self.mode == "random":
+            center_xy = coord[np.random.randint(n_points), :2]
+        elif self.mode == "center":
+            center_xy = np.mean(coord[:, :2], axis=0)
+        else:
+            raise NotImplementedError
+
+        # Compute distances in XY plane
+        dists_xy = np.linalg.norm(coord[:, :2] - center_xy, axis=1)
+
+        # Apply radius crop if needed
+        if self.radius is not None:
+            mask = dists_xy < self.radius
+            idx = np.flatnonzero(mask)
+            data_dict = index_operator(data_dict, idx)
+            coord = data_dict["coord"]
+            dists_xy = dists_xy[mask]
+            n_points = coord.shape[0]
+
+        # If still too many points, crop to point_max closest in XY
+        if n_points > point_max:
+            idx_crop = np.argsort(dists_xy)[:point_max]
+            data_dict = index_operator(data_dict, idx_crop)
+
+        return data_dict
+
+
+@TRANSFORMS.register_module()
 class SphereCrop(object):
     def __init__(self, point_max=80000, sample_rate=None, mode="random"):
         self.point_max = point_max
