@@ -1,10 +1,10 @@
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 
 
 def cosine(x, y):
-    x = nn.functional.normalize(x, dim=1)
-    y = nn.functional.normalize(y, dim=1)
+    x = F.normalize(x, dim=1)
+    y = F.normalize(y, dim=1)
     similarity = torch.einsum("nc,ck->nk", [x, y.T])
     distances = 1 - similarity
     return distances
@@ -21,4 +21,4 @@ def euclidean(x, y):
     return distances
 
 
-__dict__ = {"cosine": cosine, "euclidean": euclidean}
+DISTANCE_FUNCTIONS = {"cosine": cosine, "euclidean": euclidean}

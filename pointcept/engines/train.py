@@ -14,9 +14,9 @@ import torch.nn as nn
 import torch.utils.data
 import torch.distributed as dist
 from packaging import version
+from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
-import itertools
 
 if sys.version_info >= (3, 10):
     from collections.abc import Iterator
@@ -197,18 +197,31 @@ class Trainer(TrainerBase):
             if isinstance(input_dict[key], torch.Tensor):
                 input_dict[key] = input_dict[key].cuda(non_blocking=True)
 
-        # Only clear gradients on first accumulation step
-        if self._gradient_accumulation_counter == 0:
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        requires_backprop = getattr(model, "requires_backprop", True)
+
+        # Only clear gradients on first accumulation step.
+        if requires_backprop and self._gradient_accumulation_counter == 0:
             self.optimizer.zero_grad()
 
         # Forward pass
-        with auto_cast(
-            enabled=self.cfg.enable_amp, dtype=AMP_DTYPE[self.cfg.amp_dtype]
-        ):
-            output_dict = self.model(input_dict)
-            loss = (
-                output_dict["loss"] / self.cfg.gradient_accumulation_steps
-            )  # scale loss
+        grad_context = nullcontext() if requires_backprop else torch.no_grad()
+        with grad_context:
+            with auto_cast(
+                enabled=self.cfg.enable_amp,
+                dtype=AMP_DTYPE[self.cfg.amp_dtype],
+            ):
+                output_dict = self.model(input_dict)
+
+        if not requires_backprop:
+            if self.cfg.empty_cache:
+                torch.cuda.empty_cache()
+            self.comm_info["model_output_dict"] = output_dict
+            return
+
+        loss = (
+            output_dict["loss"] / self.cfg.gradient_accumulation_steps
+        )  # scale loss
 
         # Synchronize the finite-loss decision before entering DDP backward.
         # If any rank has a non-finite loss, every rank skips this microbatch so
@@ -333,7 +346,11 @@ class Trainer(TrainerBase):
             collate_fn=partial(point_collate_fn, mix_prob=self.cfg.mix_prob),
             pin_memory=True,
             worker_init_fn=init_fn,
-            drop_last=len(train_data) > self.cfg.batch_size,
+            drop_last=(
+                len(train_data) > self.cfg.batch_size
+                if getattr(self.cfg, "drop_last", None) is None
+                else self.cfg.drop_last
+            ),
             persistent_workers=True,
         )
         return train_loader
