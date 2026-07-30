@@ -1,5 +1,4 @@
 import torch
-from torch._C._autograd import SavedTensor
 import spconv.pytorch as spconv
 
 try:
@@ -210,16 +209,62 @@ class Point(Dict):
         self["octree_inverse"] = inverse
 
 
-def _point_ac_handler(fn, obj):
-    new_dict = {}
-    for k, v in obj.items():
-        if isinstance(v, (torch.Tensor, SavedTensor)):
-            new_dict[k] = fn(v)
-        elif isinstance(v, Point):
-            new_dict[k] = _point_ac_handler(fn, v)
-        else:
-            new_dict[k] = v
-    return Point(**new_dict)
+def _point_flatten(obj):
+    return list(obj.values()), list(obj.keys())
 
 
-register_class_for_ac(Point, _point_ac_handler)
+def _point_unflatten(values, context):
+    return Point(dict(zip(context, values, strict=True)))
+
+
+def _sparse_conv_tensor_flatten(obj):
+    values = [
+        obj.features,
+        obj.indices,
+        obj.grid,
+        obj.voxel_num,
+        obj.indice_dict,
+        obj.int8_scale,
+    ]
+    context = {
+        "spatial_shape": obj.spatial_shape,
+        "batch_size": obj.batch_size,
+        "benchmark": obj.benchmark,
+        "benchmark_record": obj.benchmark_record,
+        "thrust_allocator": obj.thrust_allocator,
+        "timer": obj._timer,
+        "force_algo": obj.force_algo,
+    }
+    return values, context
+
+
+def _sparse_conv_tensor_unflatten(values, context):
+    features, indices, grid, voxel_num, indice_dict, int8_scale = values
+    tensor = spconv.SparseConvTensor(
+        features=features,
+        indices=indices,
+        spatial_shape=context["spatial_shape"],
+        batch_size=context["batch_size"],
+        grid=grid,
+        voxel_num=voxel_num,
+        indice_dict=indice_dict,
+        benchmark=context["benchmark"],
+    )
+    tensor.benchmark_record = context["benchmark_record"]
+    tensor.thrust_allocator = context["thrust_allocator"]
+    tensor._timer = context["timer"]
+    tensor.force_algo = context["force_algo"]
+    tensor.int8_scale = int8_scale
+    return tensor
+
+
+register_class_for_ac(
+    Point,
+    flatten_fn=_point_flatten,
+    unflatten_fn=_point_unflatten,
+)
+register_class_for_ac(
+    spconv.SparseConvTensor,
+    flatten_fn=_sparse_conv_tensor_flatten,
+    unflatten_fn=_sparse_conv_tensor_unflatten,
+)

@@ -15,7 +15,13 @@ from weakref import ReferenceType
 
 import torch
 import torch.fx.traceback as fx_traceback
-from torch.utils._pytree import tree_map
+from torch.utils._pytree import (
+    tree_map,
+    register_pytree_node,
+    register_dataclass,
+    FlattenFn,
+    UnflattenFn,
+)
 from torch.testing._internal.logging_tensor import capture_logs, LoggingTensorMode
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch._C._autograd import _make_saved_tensor, SavedTensor
@@ -815,9 +821,7 @@ class _Holder:
 
 
 class _CheckpointFrame:
-    # Maps classes to functions that apply a given function to contained
-    # Tensor and SavedTensor instances.
-    _FUNCTION_APPLIERS_FOR_CUSTOM_CLASSES = {}
+    _use_tree_map = False
 
     def __init__(self, recompute_fn, early_stop, unpack_error_cb, metadata_fn) -> None:
         self.recompute_fn = recompute_fn
@@ -843,44 +847,34 @@ class _CheckpointFrame:
         self.x_metadatas = []
         self.forward_completed = False
         self.ignore_saved_mismatch = False
-    
+
     @classmethod
-    def _register_class_for_ac(cls_self, cls, fn) -> None:
-        """Register a custom class for Activation Checkpointing.
+    def _enable_tree_map(cls) -> None:
+        cls._use_tree_map = True
 
-        Args:
-            cls: The class to register.
-            fn: A function applier with signature ``fn(apply_fn, obj)``.
-                It should return an object equivalent to ``obj``, with
-                ``apply_fn`` applied to every contained ``Tensor`` or
-                ``SavedTensor`` instance.
-        """
-        cls_self._FUNCTION_APPLIERS_FOR_CUSTOM_CLASSES[cls] = fn
+    @classmethod
+    def _disable_tree_map(cls) -> None:
+        cls._use_tree_map = False
 
-    def _apply_to_input(self, fn, obj):
-        """Apply ``fn`` to Tensor and SavedTensor instances.
-
-        ``fn`` is applied directly to Tensor and SavedTensor objects, or
-        via a registered function applier for custom classes registered
-        using ``_CheckpointFrame._register_class_for_ac``.
-        Other objects are returned unchanged, i.e. as references to the original.
-        """
-        if isinstance(obj, (torch.Tensor, SavedTensor)):
-            return fn(obj)
+    def _apply_to_args(self, fn, args) -> List[Any]:
+        if not self._use_tree_map:
+            return [fn(arg) for arg in args]
         
-        custom_applier = self._FUNCTION_APPLIERS_FOR_CUSTOM_CLASSES.get(type(obj))
-        if custom_applier is not None:
-            return custom_applier(fn, obj)
-        else:
-            return obj
+        return list(tree_map(fn, args))
 
-    def save_inputs(self, *args):
-        fn = lambda x: _make_saved_tensor(x, is_output=False)
-        self.saved_args = [self._apply_to_input(fn, arg) for arg in args]
+    def save_inputs(self, *args) -> None:
+        def fn(x):
+            if isinstance(x, torch.Tensor):
+                return _make_saved_tensor(x, is_output=False)
+            return x
+        self.saved_args = self._apply_to_args(fn, args)
 
     def get_inputs(self) -> List[Any]:
-        fn = lambda x: x.unpack()
-        return [self._apply_to_input(fn, arg) for arg in self.saved_args]
+        def fn(x):
+            if isinstance(x, SavedTensor):
+                return x.unpack()
+            return x
+        return self._apply_to_args(fn, self.saved_args)
 
     def check_recomputed_tensors_match(self, gid) -> None:
         if self.ignore_saved_mismatch:
@@ -953,61 +947,130 @@ class _CheckpointFrame:
             )
 
 
-def register_class_for_ac(cls, fn):
+def enable_tree_map() -> None:
+    """Enable Activation Checkpointing for tensors inside nested containers.
+
+    Tensors are saved and restored recursively within nested standard library
+    containers and custom data structures registered with
+    :func:`register_class_for_ac`. For example, both tensors are included in
+    Activation Checkpointing for ``module(tensor1, tensor2)``,
+    ``module([tensor1, tensor2])``, and ``module(tensor1, [tensor2])``.
+    """
+    _CheckpointFrame._enable_tree_map()
+
+
+def disable_tree_map() -> None:
+    """Disable Activation Checkpointing for tensors inside nested containers.
+
+    Only tensors passed directly to a module are saved and restored. Every
+    other value remains unchanged or is stored as a reference to the original
+    object. For ``module(tensor1, tensor2)``, both tensors are included in
+    Activation Checkpointing. For ``module([tensor1, tensor2])``, neither is
+    included; for ``module(tensor1, [tensor2])``, only ``tensor1`` is included.
+    """
+    _CheckpointFrame._disable_tree_map()
+
+
+def register_class_for_ac(
+    cls: type[Any],
+    *,
+    flatten_fn: FlattenFn | None = None,
+    unflatten_fn: UnflattenFn | None = None,
+    field_names: list[str] | None = None,
+) -> None:
     r"""Register a custom class for Activation Checkpointing.
 
-    Activation Checkpointing only processes ``Tensor`` and
-    ``SavedTensor`` objects directly. This function allows registering an
-    exact class type together with a function applier that defines how
-    to apply a function to any ``Tensor`` or ``SavedTensor`` instances
-    contained within objects of that class.
+    Registration tells Activation Checkpointing how to find values within an
+    instance and reconstruct it during recomputation. Dataclasses can be
+    registered directly, dataclass-like classes by specifying ``field_names``,
+    and other classes with ``flatten_fn`` and ``unflatten_fn``.
 
     Registration uses exact type matching (``type(obj)``), not
     ``isinstance``. Subclasses are therefore not handled automatically
     and must be registered separately if needed.
 
     Args:
-        cls: The class to register.
-        fn: A function applier with signature ``fn(apply_fn, obj)``.
-            It should return an object equivalent to ``obj``, with
-            ``apply_fn`` applied to every contained ``Tensor`` or
-            ``SavedTensor`` instance.
+        cls: the container type to register
+        flatten_fn (Optional): A callable that returns the values contained in
+            an instance and context needed to reconstruct it. It must be
+            specified together with ``unflatten_fn``; omit both to use
+            dataclass-style registration.
+        unflatten_fn (Optional): A callable that reconstructs an instance from
+            its flattened values and context. It must be specified together
+            with ``flatten_fn``.
+        field_names (Optional[List[str]]): A list of field names that correspond
+            to the **non-constant data** in this class. This list must contain
+            all the fields that are used to initialize the class. It is required
+            when ``cls`` is not a dataclass and the flatten and unflatten
+            functions are omitted. It must be omitted when those functions are
+            specified. For dataclasses, fields are inferred automatically.
 
     Example:
-        Enable activation checkpointing for tensors inside dictionaries
+        Enable activation checkpointing for tensors inside a custom class by
+        providing functions that flatten and unflatten it:
 
         >>> # xdoctest: +SKIP("stub")
-        >>> from torch._C._autograd import SavedTensor
-        >>>
-        >>> def dict_applier(apply_fn, obj):
-        ...     return {
-        ...         k: apply_fn(v)
-        ...         if isinstance(v, (torch.Tensor, SavedTensor))
-        ...         else v
-        ...         for k, v in obj.items()
-        ...     }
+        >>> class MomentumState:
+        ...     def __init__(self, weight, momentum):
+        ...         self.weight = weight
+        ...         self.momentum = momentum
+        ...         self.velocity = torch.zeros_like(weight)
         ...
-        >>> register_class_for_ac(dict, dict_applier)
+        >>> def flatten_momentum_state(obj):
+        ...     values = [obj.weight, obj.velocity]
+        ...     context = obj.momentum
+        ...     return values, context
+        ...
+        >>> def unflatten_momentum_state(values, context):
+        ...     weight, velocity = values
+        ...     obj = MomentumState(weight, context)
+        ...     obj.velocity = velocity
+        ...     return obj
+        ...
+        >>> register_class_for_ac(
+        ...     MomentumState,
+        ...     flatten_fn=flatten_momentum_state,
+        ...     unflatten_fn=unflatten_momentum_state,
+        ... )
 
-        Enable activation checkpointing for tensors inside custom dataclasses
+        Dataclasses can be registered without defining flatten and unflatten
+        functions:
 
         >>> # xdoctest: +SKIP("stub")
         >>> from dataclasses import dataclass
         >>>
         >>> @dataclass
-        ... class TensorWithName:
-        ...     tensor: torch.Tensor
-        ...     name: str
+        ... class Point:
+        ...     x: torch.Tensor
+        ...     y: torch.Tensor
         ...
-        >>> def tensor_with_name_applier(apply_fn, obj):
-        ...     return TensorWithName(
-        ...         tensor=apply_fn(obj.tensor),
-        ...         name=obj.name,
-        ...     )
+        >>> register_class_for_ac(Point)
+
+        A class with dataclass-like construction can instead specify the fields
+        that should be traversed:
+
+        >>> # xdoctest: +SKIP("stub")
+        >>> class BoundingBox:
+        ...     def __init__(self, minimum, maximum):
+        ...         self.minimum = minimum
+        ...         self.maximum = maximum
         ...
-        >>> register_class_for_ac(TensorWithName, tensor_with_name_applier)
+        >>> register_class_for_ac(
+        ...     BoundingBox,
+        ...     field_names=["minimum", "maximum"],
+        ... )
     """
-    _CheckpointFrame._register_class_for_ac(cls, fn)
+    enable_tree_map()
+
+    if (flatten_fn is None) ^ (unflatten_fn is None):
+        raise ValueError("flatten_fn and unflatten_fn must both be provided, or both be None.")
+
+    if (flatten_fn is None) and (unflatten_fn is None):
+        register_dataclass(cls, field_names=field_names)
+    else:
+        if field_names:
+            raise ValueError("Cannot give field_names argument when flatten_fn and unflatten_fn are given")
+        register_pytree_node(cls, flatten_fn, unflatten_fn)
 
 
 _debug_tip_msg = """
