@@ -12,6 +12,7 @@ import wandb
 import torch
 import torch.nn as nn
 import torch.utils.data
+import torch.distributed as dist
 from packaging import version
 from functools import partial
 from pathlib import Path
@@ -209,8 +210,28 @@ class Trainer(TrainerBase):
                 output_dict["loss"] / self.cfg.gradient_accumulation_steps
             )  # scale loss
 
+        # Synchronize the finite-loss decision before entering DDP backward.
+        # If any rank has a non-finite loss, every rank skips this microbatch so
+        # collective ordering and the gradient accumulation counter stay aligned.
+        loss_is_finite = torch.isfinite(loss.detach()).to(dtype=torch.int32)
+        if comm.get_world_size() > 1:
+            dist.all_reduce(loss_is_finite, op=dist.ReduceOp.MIN)
+        all_ranks_finite = bool(loss_is_finite.item())
+
+        # Feed the guard the global decision so its streak and possible exception
+        # also remain synchronized across ranks.
+        guarded_loss = (
+            loss
+            if all_ranks_finite
+            else torch.full_like(loss.detach(), float("nan"))
+        )
+
         # Backward pass
-        if self.nonfinite_loss_guard(loss):
+        if self.nonfinite_loss_guard(
+            guarded_loss,
+            epoch=self.epoch,
+            step=self.comm_info["iter"],
+        ):
             if self.cfg.enable_amp:
                 self.scaler.scale(loss).backward()
             else:
