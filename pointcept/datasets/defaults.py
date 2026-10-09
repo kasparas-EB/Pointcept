@@ -431,6 +431,8 @@ class DefaultImagePointDataset(Dataset):
 
         if "color" in data_dict.keys():
             data_dict["color"] = data_dict["color"].astype(np.float32)
+        else:
+            data_dict["color"] = np.zeros_like(data_dict["coord"])
 
         if "normal" in data_dict.keys():
             data_dict["normal"] = data_dict["normal"].astype(np.float32)
