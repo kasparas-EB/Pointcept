@@ -16,8 +16,10 @@ from torch.utils.data import Dataset
 from collections.abc import Sequence
 from torchvision.transforms import InterpolationMode
 from PIL import Image
+from tqdm import tqdm
 from torchvision.transforms import transforms as T
 
+from pointcept.utils.comm import is_main_process
 from pointcept.utils.logger import get_root_logger
 from pointcept.utils.cache import shared_dict
 
@@ -63,7 +65,7 @@ class DefaultDataset(Dataset):
         self.transform = Compose(transform)
         self.cache = cache
         self.keep_in_memory = keep_in_memory
-        self._memory_cache = {}
+        self._memory_cache = None
         self.ignore_index = ignore_index
         self.loop = (
             loop if not test_mode else 1
@@ -84,12 +86,27 @@ class DefaultDataset(Dataset):
             f"Total {len(self.data_list)} x {self.loop} samples in {self.data_root} {split} set."
         )
 
+    def load_into_memory(self):
+        if not self.keep_in_memory or self._memory_cache is not None:
+            return
+
+        self._memory_cache = [
+            self.get_data(i)
+            for i in tqdm(
+                range(len(self.data_list)),
+                desc=f"Loading {self.split} dataset into RAM",
+                unit="sample",
+                dynamic_ncols=True,
+                disable=not is_main_process(),
+            )
+        ]
+
     def _get_data(self, idx):
         if not self.keep_in_memory:
             return self.get_data(idx)
+        if self._memory_cache is None:
+            self.load_into_memory()
         data_idx = idx % len(self.data_list)
-        if data_idx not in self._memory_cache:
-            self._memory_cache[data_idx] = self.get_data(data_idx)
         return deepcopy(self._memory_cache[data_idx])
 
     def get_data_list(self):
@@ -666,6 +683,14 @@ class ConcatDataset(Dataset):
             dataset.keep_in_memory = True
             if hasattr(dataset, "set_keep_in_memory"):
                 dataset.set_keep_in_memory()
+
+    def load_into_memory(self):
+        if not self.keep_in_memory:
+            return
+        self.set_keep_in_memory()
+        for dataset in self.datasets:
+            if hasattr(dataset, "load_into_memory"):
+                dataset.load_into_memory()
 
     def get_data_list(self):
         data_list = []

@@ -12,4 +12,7 @@ DATASETS = Registry("datasets")
 
 def build_dataset(cfg):
     """Build datasets."""
-    return DATASETS.build(cfg)
+    dataset = DATASETS.build(cfg)
+    if hasattr(dataset, "load_into_memory"):
+        dataset.load_into_memory()
+    return dataset
