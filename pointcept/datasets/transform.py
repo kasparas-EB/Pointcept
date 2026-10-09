@@ -846,10 +846,11 @@ class RandomDropNormal(object):
 
 @TRANSFORMS.register_module()
 class ElasticDistortion(object):
-    def __init__(self, distortion_params=None):
+    def __init__(self, distortion_params=None, probability=0.95):
         self.distortion_params = (
             [[0.2, 0.4], [0.8, 1.6]] if distortion_params is None else distortion_params
         )
+        self.probability = probability
 
     @staticmethod
     def elastic_distortion(coords, granularity, magnitude):
@@ -897,7 +898,7 @@ class ElasticDistortion(object):
 
     def __call__(self, data_dict):
         if "coord" in data_dict.keys() and self.distortion_params is not None:
-            if random.random() < 0.95:
+            if random.random() < self.probability:
                 for granularity, magnitude in self.distortion_params:
                     data_dict["coord"] = self.elastic_distortion(
                         data_dict["coord"], granularity, magnitude
