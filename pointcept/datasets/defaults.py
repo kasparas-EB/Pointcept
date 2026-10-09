@@ -53,6 +53,7 @@ class DefaultDataset(Dataset):
         test_mode=False,
         test_cfg=None,
         cache=False,
+        keep_in_memory=False,
         ignore_index=-1,
         loop=1,
     ):
@@ -61,6 +62,8 @@ class DefaultDataset(Dataset):
         self.split = split
         self.transform = Compose(transform)
         self.cache = cache
+        self.keep_in_memory = keep_in_memory
+        self._memory_cache = {}
         self.ignore_index = ignore_index
         self.loop = (
             loop if not test_mode else 1
@@ -80,6 +83,14 @@ class DefaultDataset(Dataset):
         logger.info(
             f"Total {len(self.data_list)} x {self.loop} samples in {self.data_root} {split} set."
         )
+
+    def _get_data(self, idx):
+        if not self.keep_in_memory:
+            return self.get_data(idx)
+        data_idx = idx % len(self.data_list)
+        if data_idx not in self._memory_cache:
+            self._memory_cache[data_idx] = self.get_data(data_idx)
+        return deepcopy(self._memory_cache[data_idx])
 
     def get_data_list(self):
         if isinstance(self.split, str):
@@ -149,13 +160,13 @@ class DefaultDataset(Dataset):
 
     def prepare_train_data(self, idx):
         # load data
-        data_dict = self.get_data(idx)
+        data_dict = self._get_data(idx)
         data_dict = self.transform(data_dict)
         return data_dict
 
     def prepare_test_data(self, idx):
         # load data
-        data_dict = self.get_data(idx)
+        data_dict = self._get_data(idx)
         data_dict = self.transform(data_dict)
         result_dict = dict(segment=data_dict.pop("segment"), name=data_dict.pop("name"))
         if "origin_segment" in data_dict:
@@ -635,10 +646,13 @@ class DefaultMultiViewImagePointDataset(DefaultImagePointDataset):
 
 @DATASETS.register_module()
 class ConcatDataset(Dataset):
-    def __init__(self, datasets, loop=1):
+    def __init__(self, datasets, loop=1, keep_in_memory=False):
         super(ConcatDataset, self).__init__()
         self.datasets = [build_dataset(dataset) for dataset in datasets]
         self.loop = loop
+        self.keep_in_memory = keep_in_memory
+        if self.keep_in_memory:
+            self.set_keep_in_memory()
         self.data_list = self.get_data_list()
         logger = get_root_logger()
         logger.info(
@@ -646,6 +660,12 @@ class ConcatDataset(Dataset):
                 len(self.data_list), self.loop
             )
         )
+
+    def set_keep_in_memory(self):
+        for dataset in self.datasets:
+            dataset.keep_in_memory = True
+            if hasattr(dataset, "set_keep_in_memory"):
+                dataset.set_keep_in_memory()
 
     def get_data_list(self):
         data_list = []
