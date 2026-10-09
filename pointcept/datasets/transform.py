@@ -50,6 +50,75 @@ def index_operator(data_dict, index, duplicate=False):
         return data_dict_
 
 
+def _grid_coordinates(coord, grid_size):
+    """Quantize coordinates using the same convention as GridSample."""
+    scaled_coord = coord / np.asarray(grid_size)
+    grid_coord = np.floor(scaled_coord).astype(int)
+    min_grid_coord = grid_coord.min(0)
+    grid_coord -= min_grid_coord
+    scaled_coord -= min_grid_coord
+    min_coord = min_grid_coord * np.asarray(grid_size)
+    return scaled_coord, grid_coord, min_coord
+
+
+def _voxelize(coord, grid_size, hash_func):
+    """Group grid cells for sampling, inverse mapping, and test partitioning."""
+    scaled_coord, grid_coord, min_coord = _grid_coordinates(coord, grid_size)
+
+    key = hash_func(grid_coord)
+    idx_sort = np.argsort(key)
+    key_sort = key[idx_sort]
+    _, inverse, count = np.unique(key_sort, return_inverse=True, return_counts=True)
+    return scaled_coord, grid_coord, min_coord, idx_sort, inverse, count
+
+
+def _sample_grid_indices(idx_sort, count):
+    """Select one input point from each occupied grid cell."""
+    group_start = np.cumsum(np.insert(count, 0, 0)[:-1])
+    idx_select = group_start + np.random.randint(0, count.max(), count.size) % count
+    return idx_sort[idx_select]
+
+
+def _first_grid_indices(coord, grid_size):
+    """Select the first input point from each occupied grid cell."""
+    _, grid_coord, _ = _grid_coordinates(coord, grid_size)
+    _, idx_unique = np.unique(grid_coord, axis=0, return_index=True)
+    return idx_unique
+
+
+def _apply_crop_constraints(
+    data_dict,
+    center,
+    axes,
+    radius=None,
+    point_max=None,
+    grid_indices=None,
+    grid_point_max=None,
+):
+    """Apply crop constraints from highest to lowest priority."""
+    coord = data_dict["coord"]
+    point_dist = np.sum(np.square(coord[:, axes] - center), axis=1)
+    idx_crop = np.arange(coord.shape[0])
+
+    # A later constraint may only shrink the result of an earlier constraint.
+    if radius is not None:
+        idx_crop = idx_crop[point_dist < radius**2]
+
+    if point_max is not None and idx_crop.shape[0] > point_max:
+        idx_crop = idx_crop[np.argsort(point_dist[idx_crop])[:point_max]]
+
+    if grid_point_max is not None and grid_indices.shape[0] > grid_point_max:
+        grid_dist = point_dist[grid_indices]
+        grid_radius2 = np.partition(grid_dist, grid_point_max - 1)[
+            grid_point_max - 1
+        ]
+        idx_crop = idx_crop[point_dist[idx_crop] <= grid_radius2]
+
+    if idx_crop.shape[0] < coord.shape[0]:
+        data_dict = index_operator(data_dict, idx_crop)
+    return data_dict
+
+
 @TRANSFORMS.register_module()
 class Collect(object):
     def __init__(self, keys, offset_keys_dict=None, **kwargs):
@@ -861,22 +930,11 @@ class GridSample(object):
 
     def __call__(self, data_dict):
         assert "coord" in data_dict.keys()
-        scaled_coord = data_dict["coord"] / np.array(self.grid_size)
-        grid_coord = np.floor(scaled_coord).astype(int)
-        min_coord = grid_coord.min(0)
-        grid_coord -= min_coord
-        scaled_coord -= min_coord
-        min_coord = min_coord * np.array(self.grid_size)
-        key = self.hash(grid_coord)
-        idx_sort = np.argsort(key)
-        key_sort = key[idx_sort]
-        _, inverse, count = np.unique(key_sort, return_inverse=True, return_counts=True)
+        scaled_coord, grid_coord, min_coord, idx_sort, inverse, count = _voxelize(
+            data_dict["coord"], self.grid_size, self.hash
+        )
         if self.mode == "train":  # train mode
-            idx_select = (
-                np.cumsum(np.insert(count, 0, 0)[0:-1])
-                + np.random.randint(0, count.max(), count.size) % count
-            )
-            idx_unique = idx_sort[idx_select]
+            idx_unique = _sample_grid_indices(idx_sort, count)
             if "sampled_index" in data_dict:
                 # for ScanNet data efficient, we need to make sure labeled point is sampled.
                 idx_unique = np.unique(
@@ -915,8 +973,9 @@ class GridSample(object):
 
         elif self.mode == "test":  # test mode
             data_part_list = []
+            group_start = np.cumsum(np.insert(count, 0, 0)[:-1])
             for i in range(count.max()):
-                idx_select = np.cumsum(np.insert(count, 0, 0)[0:-1]) + i % count
+                idx_select = group_start + i % count
                 idx_part = idx_sort[idx_select]
                 data_part = index_operator(data_dict, idx_part, duplicate=True)
                 data_part["index"] = idx_part
@@ -1013,12 +1072,34 @@ class GridSample(object):
 
 @TRANSFORMS.register_module()
 class CylinderCrop(object):
-    def __init__(self, point_max=None, sample_rate=None, radius=None, mode="random"):
+    def __init__(
+        self,
+        point_max=None,
+        sample_rate=None,
+        radius=None,
+        mode="random",
+        grid_point_max=None,
+        grid_size=None,
+    ):
+        """
+        Crop a vertical cylinder around a random or central point.
+
+        ``radius``, ``point_max``, and ``grid_point_max`` are independent crop
+        constraints. When multiple constraints are set, the most restrictive
+        one wins. ``grid_point_max`` requires ``grid_size`` and estimates a
+        radius from a temporary voxelization without modifying the input data.
+        """
         self.point_max = point_max
         self.sample_rate = sample_rate
         self.radius = radius
+        self.grid_point_max = grid_point_max
+        self.grid_size = grid_size
         assert mode in ["random", "center"]
         self.mode = mode
+        if (self.grid_point_max is None) != (self.grid_size is None):
+            raise ValueError("grid_point_max and grid_size must be set together")
+        if self.grid_point_max is not None and self.grid_point_max <= 0:
+            raise ValueError("grid_point_max must be positive")
 
     def __call__(self, data_dict):
         assert "coord" in data_dict.keys()
@@ -1031,11 +1112,20 @@ class CylinderCrop(object):
             if self.sample_rate is not None
             else self.point_max
         )
-        if point_max is None:
-            point_max = n_points
+
+        grid_indices = None
+        if self.grid_point_max is not None:
+            grid_indices = _first_grid_indices(coord, self.grid_size)
 
         # Skip if nothing to crop
-        if self.radius is None and n_points <= point_max:
+        if (
+            self.radius is None
+            and (point_max is None or n_points <= point_max)
+            and (
+                self.grid_point_max is None
+                or grid_indices.shape[0] <= self.grid_point_max
+            )
+        ):
             return data_dict
 
         # Select center point in XY plane
@@ -1046,70 +1136,100 @@ class CylinderCrop(object):
         else:
             raise NotImplementedError
 
-        # Compute distances in XY plane
-        dists_xy = np.linalg.norm(coord[:, :2] - center_xy, axis=1)
-
-        # Apply radius crop if needed
-        if self.radius is not None:
-            mask = dists_xy < self.radius
-            idx = np.flatnonzero(mask)
-            data_dict = index_operator(data_dict, idx)
-            coord = data_dict["coord"]
-            dists_xy = dists_xy[mask]
-            n_points = coord.shape[0]
-
-        # If still too many points, crop to point_max closest in XY
-        if n_points > point_max:
-            idx_crop = np.argsort(dists_xy)[:point_max]
-            data_dict = index_operator(data_dict, idx_crop)
-
-        return data_dict
+        return _apply_crop_constraints(
+            data_dict=data_dict,
+            center=center_xy,
+            axes=np.array([0, 1]),
+            radius=self.radius,
+            point_max=point_max,
+            grid_indices=grid_indices,
+            grid_point_max=self.grid_point_max,
+        )
 
 
 @TRANSFORMS.register_module()
 class SphereCrop(object):
-    def __init__(self, point_max=80000, sample_rate=None, mode="random"):
+    def __init__(
+        self,
+        point_max=80000,
+        sample_rate=None,
+        mode="random",
+        radius=None,
+        grid_point_max=None,
+        grid_size=None,
+    ):
+        """
+        Crop a sphere around a random, central, or given point.
+
+        ``radius``, ``point_max``, and ``grid_point_max`` are independent crop
+        constraints. When multiple constraints are set, the most restrictive
+        one wins. ``grid_point_max`` requires ``grid_size`` and estimates a
+        radius from a temporary voxelization without modifying the input data.
+        """
         self.point_max = point_max
         self.sample_rate = sample_rate
+        self.radius = radius
+        self.grid_point_max = grid_point_max
+        self.grid_size = grid_size
         assert mode in ["random", "center", "all", "given"]
         self.mode = mode
+        if (self.grid_point_max is None) != (self.grid_size is None):
+            raise ValueError("grid_point_max and grid_size must be set together")
+        if self.grid_point_max is not None and self.grid_point_max <= 0:
+            raise ValueError("grid_point_max must be positive")
 
     def __call__(self, data_dict):
+        assert "coord" in data_dict.keys()
+        coord = data_dict["coord"]
+        n_points = coord.shape[0]
         point_max = (
-            int(self.sample_rate * data_dict["coord"].shape[0])
+            int(self.sample_rate * n_points)
             if self.sample_rate is not None
             else self.point_max
         )
 
-        assert "coord" in data_dict.keys()
-        if data_dict["coord"].shape[0] > point_max:
-            if self.mode == "random":
-                center = data_dict["coord"][
-                    np.random.randint(data_dict["coord"].shape[0])
-                ]
-            elif self.mode == "center":
-                center = data_dict["coord"][data_dict["coord"].shape[0] // 2]
-            elif self.mode == "given":
-                given_index = data_dict["correspondence"].reshape(
-                    data_dict["correspondence"].shape[0], -1
-                )
-                given_index = np.all(
-                    given_index != np.ones_like(given_index[0]) * -1, axis=1
-                )
-                given_coord = data_dict["coord"][given_index]
-                if given_coord.shape[0] == 0:
-                    center = data_dict["coord"][
-                        np.random.randint(data_dict["coord"].shape[0])
-                    ]
-                else:
-                    center = np.mean(given_coord, axis=0)
+        grid_indices = None
+        if self.grid_point_max is not None:
+            grid_indices = _first_grid_indices(coord, self.grid_size)
+
+        if (
+            self.radius is None
+            and (point_max is None or n_points <= point_max)
+            and (
+                self.grid_point_max is None
+                or grid_indices.shape[0] <= self.grid_point_max
+            )
+        ):
+            return data_dict
+
+        if self.mode == "random":
+            center = coord[np.random.randint(n_points)]
+        elif self.mode == "center":
+            center = coord[n_points // 2]
+        elif self.mode == "given":
+            given_index = data_dict["correspondence"].reshape(
+                data_dict["correspondence"].shape[0], -1
+            )
+            given_index = np.all(
+                given_index != np.ones_like(given_index[0]) * -1, axis=1
+            )
+            given_coord = coord[given_index]
+            if given_coord.shape[0] == 0:
+                center = coord[np.random.randint(n_points)]
             else:
-                raise NotImplementedError
-            idx_crop = np.argsort(np.sum(np.square(data_dict["coord"] - center), 1))[
-                :point_max
-            ]
-            data_dict = index_operator(data_dict, idx_crop)
-        return data_dict
+                center = np.mean(given_coord, axis=0)
+        else:
+            raise NotImplementedError
+
+        return _apply_crop_constraints(
+            data_dict=data_dict,
+            center=center,
+            axes=np.array([0, 1, 2]),
+            radius=self.radius,
+            point_max=point_max,
+            grid_indices=grid_indices,
+            grid_point_max=self.grid_point_max,
+        )
 
 
 @TRANSFORMS.register_module()
