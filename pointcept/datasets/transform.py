@@ -181,6 +181,85 @@ class Update(object):
 
 
 @TRANSFORMS.register_module()
+class RemapClassID(object):
+    """Remap segment IDs by matching source and target class names."""
+
+    def __init__(
+        self,
+        original_map: dict[str, int],
+        target_map: dict[str, int],
+        remap: dict[str, str],
+        default_class_id: int | None = None,
+        validate: bool = True,
+    ):
+        missing_classes = original_map.keys() - remap.keys()
+        if missing_classes and default_class_id is None:
+            raise ValueError(
+                "remap is missing original classes and default_class_id is None: "
+                f"{sorted(missing_classes)}"
+            )
+
+        unknown_targets = {
+            remap[class_name]
+            for class_name in original_map
+            if class_name in remap and remap[class_name] not in target_map
+        }
+        if unknown_targets:
+            raise ValueError(
+                "remap contains target classes not present in target_map: "
+                f"{sorted(unknown_targets)}"
+            )
+        if not original_map:
+            raise ValueError("original_map must not be empty")
+
+        original_ids = np.asarray(list(original_map.values()), dtype=np.int64)
+        if np.unique(original_ids).size != original_ids.size:
+            raise ValueError("original_map class IDs must be unique")
+
+        self.min_original_id = original_ids.min()
+        self.validate = validate
+        max_original_id = original_ids.max()
+        lookup_size = max_original_id - self.min_original_id + 1
+        self.class_id_lookup = np.empty(lookup_size, dtype=np.int64)
+        self.valid_class_ids = np.zeros(lookup_size, dtype=bool)
+
+        for class_name, original_id in original_map.items():
+            lookup_index = original_id - self.min_original_id
+            if class_name in remap:
+                target_id = target_map[remap[class_name]]
+            else:
+                target_id = default_class_id
+            self.class_id_lookup[lookup_index] = target_id
+            self.valid_class_ids[lookup_index] = True
+
+    def __call__(self, data_dict):
+        segment = np.asarray(data_dict["segment"])
+        lookup_index = (
+            segment
+            if self.min_original_id == 0
+            else segment - self.min_original_id
+        )
+        if self.validate:
+            if not np.issubdtype(segment.dtype, np.integer):
+                raise TypeError("segment must contain integer class IDs")
+
+            in_range = (lookup_index >= 0) & (
+                lookup_index < self.class_id_lookup.size
+            )
+            valid = np.zeros(segment.shape, dtype=bool)
+            valid[in_range] = self.valid_class_ids[lookup_index[in_range]]
+            if not np.all(valid):
+                unknown_ids = np.unique(segment[~valid]).tolist()
+                raise ValueError(
+                    "segment contains class IDs not present in original_map: "
+                    f"{unknown_ids}"
+                )
+
+        data_dict["segment"] = self.class_id_lookup[lookup_index]
+        return data_dict
+
+
+@TRANSFORMS.register_module()
 class ToTensor(object):
     def __call__(self, data):
         if isinstance(data, torch.Tensor):
