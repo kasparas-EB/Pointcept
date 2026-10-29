@@ -182,7 +182,12 @@ class Update(object):
 
 @TRANSFORMS.register_module()
 class RemapClassID(object):
-    """Remap segment IDs by matching source and target class names."""
+    """Remap class IDs in all semantic-segment fields by class name.
+
+    A semantic-segment field is named ``segment`` or has a ``_segment`` suffix,
+    such as ``origin_segment``.  Remapping every such field keeps sampled and
+    original-resolution labels in the same class-ID space.
+    """
 
     def __init__(
         self,
@@ -232,8 +237,8 @@ class RemapClassID(object):
             self.class_id_lookup[lookup_index] = target_id
             self.valid_class_ids[lookup_index] = True
 
-    def __call__(self, data_dict):
-        segment = np.asarray(data_dict["segment"])
+    def _remap_segment(self, segment, key):
+        segment = np.asarray(segment)
         lookup_index = (
             segment
             if self.min_original_id == 0
@@ -241,7 +246,7 @@ class RemapClassID(object):
         )
         if self.validate:
             if not np.issubdtype(segment.dtype, np.integer):
-                raise TypeError("segment must contain integer class IDs")
+                raise TypeError(f"{key} must contain integer class IDs")
 
             in_range = (lookup_index >= 0) & (
                 lookup_index < self.class_id_lookup.size
@@ -251,11 +256,27 @@ class RemapClassID(object):
             if not np.all(valid):
                 unknown_ids = np.unique(segment[~valid]).tolist()
                 raise ValueError(
-                    "segment contains class IDs not present in original_map: "
+                    f"{key} contains class IDs not present in original_map: "
                     f"{unknown_ids}"
                 )
 
-        data_dict["segment"] = self.class_id_lookup[lookup_index]
+        return self.class_id_lookup[lookup_index]
+
+    def __call__(self, data_dict):
+        segment_keys = [
+            key
+            for key in data_dict
+            if isinstance(key, str) and (key == "segment" or key.endswith("_segment"))
+        ]
+        if not segment_keys:
+            raise KeyError("no semantic-segment key found in data_dict")
+
+        # Compute every result before mutating the dictionary so a validation
+        # failure cannot leave only some segment fields remapped.
+        remapped_segments = {
+            key: self._remap_segment(data_dict[key], key) for key in segment_keys
+        }
+        data_dict.update(remapped_segments)
         return data_dict
 
 
